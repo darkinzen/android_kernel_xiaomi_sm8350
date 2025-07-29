@@ -65,6 +65,10 @@
 #include <linux/vmalloc.h>
 
 #include <linux/uaccess.h>
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+#include <linux/susfs_def.h>
+#endif
+
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
 
@@ -1832,7 +1836,93 @@ static int __do_execve_file(int fd, struct filename *filename,
 	if (retval < 0)
 		goto out;
 
-	retval = prepare_binprm(bprm);
+	/* execve succeeded */
+	current->fs->in_exec = 0;
+	current->in_execve = 0;
+	rseq_execve(current);
+	acct_update_integrals(current);
+	task_numa_free(current, false);
+	if (displaced)
+		put_files_struct(displaced);
+	return retval;
+
+out:
+	/*
+	 * If past the point of no return ensure the the code never
+	 * returns to the userspace process.  Use an existing fatal
+	 * signal if present otherwise terminate the process with
+	 * SIGSEGV.
+	 */
+	if (bprm->point_of_no_return && !fatal_signal_pending(current))
+		force_sigsegv(SIGSEGV);
+
+out_unmark:
+	current->fs->in_exec = 0;
+	current->in_execve = 0;
+
+out_files:
+	if (displaced)
+		reset_files_struct(displaced);
+
+	return retval;
+}
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+extern bool susfs_is_sus_su_hooks_enabled __read_mostly;
+extern bool __ksu_is_allow_uid(uid_t uid);
+extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv,
+				void *envp, int *flags);
+#endif
+
+static int do_execveat_common(int fd, struct filename *filename,
+			      struct user_arg_ptr argv,
+			      struct user_arg_ptr envp,
+			      int flags)
+{
+	struct linux_binprm *bprm;
+	int retval;
+
+	if (IS_ERR(filename))
+		return PTR_ERR(filename);
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (likely(susfs_is_current_proc_su_not_allowed())) {
+		goto orig_flow;
+	}
+	if (likely(susfs_is_sus_su_hooks_enabled) &&
+		unlikely(__ksu_is_allow_uid(current_uid().val)))
+	{
+		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+	}
+orig_flow:
+#endif
+
+	/*
+	 * We move the actual failure in case of RLIMIT_NPROC excess from
+	 * set*uid() to execve() because too many poorly written programs
+	 * don't check setuid() return code.  Here we additionally recheck
+	 * whether NPROC limit is still exceeded.
+	 */
+	if ((current->flags & PF_NPROC_EXCEEDED) &&
+	    atomic_read(&current_user()->processes) > rlimit(RLIMIT_NPROC)) {
+		retval = -EAGAIN;
+		goto out_ret;
+	}
+
+	/* We're below the limit (still or again), so we don't want to make
+	 * further execve() calls fail. */
+	current->flags &= ~PF_NPROC_EXCEEDED;
+
+	bprm = alloc_bprm(fd, filename);
+	if (IS_ERR(bprm)) {
+		retval = PTR_ERR(bprm);
+		goto out_ret;
+	}
+
+	retval = count(argv, MAX_ARG_STRINGS);
+	if (retval == 0)
+		pr_warn_once("process '%s' launched '%s' with NULL argv: empty string added\n",
+			     current->comm, bprm->filename);
 	if (retval < 0)
 		goto out;
 
